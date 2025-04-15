@@ -1,0 +1,424 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Task Management System for Field Teams
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: nodejs16.x
+    MemorySize: 256
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        TASKS_TABLE: !Ref TasksTable
+        USERS_TABLE: !Ref UsersTable
+        TASK_ASSIGNMENT_QUEUE_URL: !Ref TaskAssignmentQueue
+        TASK_ASSIGNMENT_TOPIC_ARN: !Ref TaskAssignmentNotificationTopic
+        TASK_DEADLINE_TOPIC_ARN: !Ref TaskDeadlineNotificationTopic
+        CLOSED_TASK_TOPIC_ARN: !Ref ClosedTaskNotificationTopic
+        TASK_COMPLETE_TOPIC_ARN: !Ref TaskCompleteNotificationTopic
+        USER_POOL_ID: !Ref UserPool
+        USER_POOL_CLIENT_ID: !Ref UserPoolClient
+        REGION: !Ref AWS::Region
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Environment to deploy to
+
+Resources:
+  # Cognito Resources
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'task-management-user-pool-${Environment}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: role
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub 'task-management-client-${Environment}'
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # DynamoDB Tables
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'tasks-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: task_id
+          AttributeType: S
+        - AttributeName: assigned_to
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: deadline
+          AttributeType: S
+      KeySchema:
+        - AttributeName: task_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserTasksIndex
+          KeySchema:
+            - AttributeName: assigned_to
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusDeadlineIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: deadline
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'users-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EmailIndex
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # SNS Topics
+  TaskAssignmentNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'task-assignment-notification-${Environment}'
+      DisplayName: 'Task Assignment Notifications'
+
+  TaskDeadlineNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'task-deadline-notification-${Environment}'
+      DisplayName: 'Task Deadline Notifications'
+
+  ClosedTaskNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'closed-task-notification-${Environment}'
+      DisplayName: 'Closed Task Notifications'
+
+  TaskCompleteNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'task-complete-notification-${Environment}'
+      DisplayName: 'Task Complete Notifications'
+
+  # SQS Queues
+  TaskAssignmentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'task-assignment-queue-${Environment}.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TaskAssignmentDLQ.Arn
+        maxReceiveCount: 3
+
+  TaskAssignmentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'task-assignment-dlq-${Environment}.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+
+  ExpiredTasksQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'expired-tasks-queue-${Environment}'
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ExpiredTasksDLQ.Arn
+        maxReceiveCount: 3
+
+  ExpiredTasksDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'expired-tasks-dlq-${Environment}'
+
+  # API Gateway
+  TaskAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  # Step Functions
+  OnboardingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachines/onboarding.asl.json
+      Role: !GetAtt StepFunctionsExecutionRole.Arn
+
+  TaskExpirationStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachines/task-expiration.asl.json
+      Role: !GetAtt StepFunctionsExecutionRole.Arn
+
+  # Lambda Functions
+  CreateTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/tasks/
+      Handler: create.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TasksTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt TaskAssignmentQueue.QueueName
+      Events:
+        CreateTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TaskAPI
+            Path: /tasks
+            Method: post
+
+  GetTasksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/tasks/
+      Handler: list.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TasksTable
+      Events:
+        GetTasks:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TaskAPI
+            Path: /tasks
+            Method: get
+
+  UpdateTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/tasks/
+      Handler: update.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TasksTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt TaskCompleteNotificationTopic.TopicName
+      Events:
+        UpdateTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TaskAPI
+            Path: /tasks/{taskId}
+            Method: put
+
+  ReopenTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/tasks/
+      Handler: reopen.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TasksTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt TaskAssignmentNotificationTopic.TopicName
+      Events:
+        ReopenTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TaskAPI
+            Path: /tasks/{taskId}/reopen
+            Method: post
+
+  ProcessTaskAssignmentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/notifications/
+      Handler: processTaskAssignment.handler
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt TaskAssignmentNotificationTopic.TopicName
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TaskAssignmentQueue.Arn
+            BatchSize: 1
+
+  HandleDeadlineNotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/notifications/
+      Handler: handleDeadlineNotification.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TasksTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt TaskDeadlineNotificationTopic.TopicName
+
+  HandleTaskExpirationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/notifications/
+      Handler: handleTaskExpiration.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TasksTable
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt TaskExpirationStateMachine.Name
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ExpiredTasksQueue.Arn
+            BatchSize: 1
+
+  UserOnboardingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/auth/
+      Handler: onboarding.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt OnboardingStateMachine.Name
+      Events:
+        CognitoPostConfirmation:
+          Type: Cognito
+          Properties:
+            UserPool: !Ref UserPool
+            Trigger: PostConfirmation
+
+  SubscribeUserToTopicsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/auth/
+      Handler: subscribeToTopics.handler
+      Policies:
+        - SNSCrudPolicy:
+            TopicName: !GetAtt TaskAssignmentNotificationTopic.TopicName
+        - SNSCrudPolicy:
+            TopicName: !GetAtt TaskDeadlineNotificationTopic.TopicName
+        - SNSCrudPolicy:
+            TopicName: !GetAtt ClosedTaskNotificationTopic.TopicName
+        - SNSCrudPolicy:
+            TopicName: !GetAtt TaskCompleteNotificationTopic.TopicName
+
+  CheckExpiredTasksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/tasks/
+      Handler: checkExpiredTasks.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TasksTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ExpiredTasksQueue.QueueName
+      Events:
+        ScheduledEvent:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Name: check-expired-tasks
+            Description: Check for expired tasks every 5 minutes
+            Enabled: true
+
+  # IAM Roles
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaRole'
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource:
+                  - !Ref TaskAssignmentNotificationTopic
+                  - !Ref TaskDeadlineNotificationTopic
+                  - !Ref ClosedTaskNotificationTopic
+                  - !Ref TaskCompleteNotificationTopic
+
+Outputs:
+  TaskAPIEndpoint:
+    Description: API Gateway endpoint URL for the Task API
+    Value: !Sub 'https://${TaskAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/'
+
+  UserPoolId:
+    Description: ID of the Cognito User Pool
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: ID of the Cognito User Pool Client
+    Value: !Ref UserPoolClient
